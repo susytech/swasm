@@ -1,12 +1,11 @@
-use io;
-use std::vec::Vec;
-use std::borrow::ToOwned;
-use byteorder::{LittleEndian, ByteOrder};
+use crate::rust::{vec::Vec, borrow::ToOwned, string::String, cmp};
+use crate::io;
 
 use super::{Deserialize, Serialize, Error, Uint32, External};
 use super::section::{
 	Section, CodeSection, TypeSection, ImportSection, ExportSection, FunctionSection,
-	GlobalSection, TableSection, ElementSection, DataSection, MemorySection
+	GlobalSection, TableSection, ElementSection, DataSection, MemorySection,
+	CustomSection,
 };
 use super::name_section::NameSection;
 use super::reloc_section::RelocSection;
@@ -37,7 +36,7 @@ pub enum ImportCountType {
 impl Default for Module {
 	fn default() -> Self {
 		Module {
-			magic: LittleEndian::read_u32(&WASM_MAGIC_NUMBER),
+			magic: u32::from_le_bytes(WASM_MAGIC_NUMBER),
 			version: 1,
 			sections: Vec::with_capacity(16),
 		}
@@ -61,12 +60,14 @@ impl Module {
 	pub fn version(&self) -> u32 { self.version }
 
 	/// Sections list.
+	///
 	/// Each known section is optional and may appear at most once.
 	pub fn sections(&self) -> &[Section] {
 		&self.sections
 	}
 
-	/// Sections list (mutable)
+	/// Sections list (mutable).
+	///
 	/// Each known section is optional and may appear at most once.
 	pub fn sections_mut(&mut self) -> &mut Vec<Section> {
 		&mut self.sections
@@ -241,7 +242,90 @@ impl Module {
 		None
 	}
 
+	/// Changes the module's start section.
+	pub fn set_start_section(&mut self, new_start: u32) {
+		for section in self.sections_mut().iter_mut() {
+			if let &mut Section::Start(_sect) = section {
+				*section = Section::Start(new_start);
+				return
+			}
+		}
+		let insert_before = self.sections().iter().enumerate()
+			.filter_map(|(i, s)| if s.order() > 0x8 { Some(i) } else { None })
+			.next()
+			.unwrap_or(0);
+		self.sections_mut().insert(insert_before, Section::Start(new_start));
+	}
+
+	/// Removes the module's start section.
+	pub fn clear_start_section(&mut self) {
+		let sections = self.sections_mut();
+		let mut rmidx = sections.len();
+		for (index, section) in sections.iter_mut().enumerate() {
+			if let Section::Start(_sect) = section {
+				rmidx = index;
+				break;
+			}
+		}
+		if rmidx < sections.len() {
+			sections.remove(rmidx);
+		}
+	}
+
+	/// Returns an iterator over the module's custom sections
+	pub fn custom_sections(&self) -> impl Iterator<Item=&CustomSection> {
+		self.sections().iter().filter_map(|s| {
+			if let Section::Custom(s) = s {
+				Some(s)
+			} else {
+				None
+			}
+		})
+	}
+
+	/// Sets the payload associated with the given custom section, or adds a new custom section,
+	/// as appropriate.
+	pub fn set_custom_section(&mut self, name: impl Into<String>, payload: Vec<u8>) {
+		let name: String = name.into();
+		for section in self.sections_mut() {
+			if let &mut Section::Custom(ref mut sect) = section {
+				if sect.name() == name {
+					*sect = CustomSection::new(name, payload);
+					return
+				}
+			}
+		}
+		self.sections_mut().push(Section::Custom(CustomSection::new(name, payload)));
+	}
+
+	/// Removes the given custom section, if it exists.
+	/// Returns the removed section if it existed, or None otherwise.
+	pub fn clear_custom_section(&mut self, name: impl AsRef<str>) -> Option<CustomSection> {
+		let name: &str = name.as_ref();
+
+		let sections = self.sections_mut();
+
+		for i in 0..sections.len() {
+			let mut remove = false;
+			if let Section::Custom(ref sect) = sections[i] {
+				if sect.name() == name {
+					remove = true;
+				}
+			}
+
+			if remove {
+				let removed = sections.remove(i);
+				match removed {
+					Section::Custom(sect) => return Some(sect),
+					_ => unreachable!(), // This is the section we just matched on, so...
+				}
+			}
+		}
+		None
+	}
+
 	/// Functions signatures section reference, if any.
+	///
 	/// NOTE: name section is not parsed by default so `names_section` could return None even if name section exists.
 	/// Call `parse_names` to parse name section
 	pub fn names_section(&self) -> Option<&NameSection> {
@@ -252,6 +336,7 @@ impl Module {
 	}
 
 	/// Functions signatures section mutable reference, if any.
+	///
 	/// NOTE: name section is not parsed by default so `names_section` could return None even if name section exists.
 	/// Call `parse_names` to parse name section
 	pub fn names_section_mut(&mut self) -> Option<&mut NameSection> {
@@ -261,7 +346,8 @@ impl Module {
 		None
 	}
 
-	/// Try to parse name section in place
+	/// Try to parse name section in place.
+	///
 	/// Corresponding custom section with proper header will convert to name sections
 	/// If some of them will fail to be decoded, Err variant is returned with the list of
 	/// (index, Error) tuples of failed sections.
@@ -284,6 +370,7 @@ impl Module {
 					}
 				} else { None }
 			} {
+				// todo: according to the spec a Wasm binary can contain only one name section
 				*self.sections.get_mut(i).expect("cannot fail because i in range 0..len; qed") = Section::Name(name_section);
 			}
 		}
@@ -295,7 +382,8 @@ impl Module {
 		}
 	}
 
-	/// Try to parse reloc section in place
+	/// Try to parse reloc section in place.
+	///
 	/// Corresponding custom section with proper header will convert to reloc sections
 	/// If some of them will fail to be decoded, Err variant is returned with the list of
 	/// (index, Error) tuples of failed sections.
@@ -336,7 +424,7 @@ impl Module {
 		}
 	}
 
-	/// Count imports by provided type
+	/// Count imports by provided type.
 	pub fn import_count(&self, count_type: ImportCountType) -> usize {
 		self.import_section()
 			.map(|is|
@@ -350,25 +438,25 @@ impl Module {
 			.unwrap_or(0)
 	}
 
-	/// Query functions space
+	/// Query functions space.
 	pub fn functions_space(&self) -> usize {
 		self.import_count(ImportCountType::Function) +
 			self.function_section().map(|fs| fs.entries().len()).unwrap_or(0)
 	}
 
-	/// Query globals space
+	/// Query globals space.
 	pub fn globals_space(&self) -> usize {
 		self.import_count(ImportCountType::Global) +
 			self.global_section().map(|gs| gs.entries().len()).unwrap_or(0)
 	}
 
-	/// Query table space
+	/// Query table space.
 	pub fn table_space(&self) -> usize {
 		self.import_count(ImportCountType::Table) +
 			self.table_section().map(|ts| ts.entries().len()).unwrap_or(0)
 	}
 
-	/// Query memory space
+	/// Query memory space.
 	pub fn memory_space(&self) -> usize {
 		self.import_count(ImportCountType::Memory) +
 			self.memory_section().map(|ms| ms.entries().len()).unwrap_or(0)
@@ -393,20 +481,20 @@ impl Deserialize for Module {
 			return Err(Error::UnsupportedVersion(version));
 		}
 
-		let mut last_section_id = 0;
+		let mut last_section_order = 0;
 
 		loop {
 			match Section::deserialize(reader) {
 				Err(Error::UnexpectedEof) => { break; },
 				Err(e) => { return Err(e) },
 				Ok(section) => {
-					if section.id() != 0 {
-						if last_section_id > section.id() {
+					if section.order() != 0 {
+						if last_section_order > section.order() {
 							return Err(Error::SectionsOutOfOrder);
-						} else if last_section_id == section.id() {
-							return Err(Error::DuplicatedSections(last_section_id));
+						} else if last_section_order == section.order() {
+							return Err(Error::DuplicatedSections(last_section_order));
 						}
-						last_section_id = section.id();
+						last_section_order = section.order();
 					}
 					sections.push(section);
 				}
@@ -414,7 +502,7 @@ impl Deserialize for Module {
 		}
 
 		let module = Module {
-			magic: LittleEndian::read_u32(&magic),
+			magic: u32::from_le_bytes(magic),
 			version: version,
 			sections: sections,
 		};
@@ -436,6 +524,7 @@ impl Serialize for Module {
 		Uint32::from(self.magic).serialize(w)?;
 		Uint32::from(self.version).serialize(w)?;
 		for section in self.sections.into_iter() {
+			// todo: according to the spec the name section should appear after the data section
 			section.serialize(w)?;
 		}
 		Ok(())
@@ -450,7 +539,7 @@ struct PeekSection<'a> {
 
 impl<'a> io::Read for PeekSection<'a> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
-		let available = ::std::cmp::min(buf.len(), self.region.len() - self.cursor);
+		let available = cmp::min(buf.len(), self.region.len() - self.cursor);
 		if available < buf.len() {
 			return Err(io::Error::UnexpectedEof);
 		}
@@ -463,7 +552,7 @@ impl<'a> io::Read for PeekSection<'a> {
 	}
 }
 
-/// Returns size of the module in the provided stream
+/// Returns size of the module in the provided stream.
 pub fn peek_size(source: &[u8]) -> usize {
 	if source.len() < 9 {
 		return 0;
@@ -504,7 +593,6 @@ pub fn peek_size(source: &[u8]) -> usize {
 
 #[cfg(test)]
 mod integration_tests {
-
 	use super::super::{deserialize_file, serialize, deserialize_buffer, Section};
 	use super::Module;
 
@@ -667,8 +755,6 @@ mod integration_tests {
 
 	#[test]
 	fn names() {
-		use super::super::name_section::NameSection;
-
 		let module = deserialize_file("./res/cases/v1/with_names.wasm")
 			.expect("Should be deserialized")
 			.parse_names()
@@ -678,21 +764,19 @@ mod integration_tests {
 		for section in module.sections() {
 			match *section {
 				Section::Name(ref name_section) => {
-					match *name_section {
-						NameSection::Function(ref function_name_section) => {
-							assert_eq!(
-								function_name_section.names().get(0).expect("Should be entry #0"),
-								"elog"
-							);
-							assert_eq!(
-								function_name_section.names().get(11).expect("Should be entry #0"),
-								"_ZN48_$LT$swasm_token_contract..Endpoint$LT$T$GT$$GT$3new17hc3ace6dea0978cd9E"
-							);
+					let function_name_subsection = name_section
+						.functions()
+						.expect("function_name_subsection should be present");
+					assert_eq!(
+						function_name_subsection.names().get(0).expect("Should be entry #0"),
+						"elog"
+					);
+					assert_eq!(
+						function_name_subsection.names().get(11).expect("Should be entry #0"),
+						"_ZN48_$LT$swasm_token_contract..Endpoint$LT$T$GT$$GT$3new17hc3ace6dea0978cd9E"
+					);
 
-							found_section = true;
-						},
-						_ => {},
-					}
+					found_section = true;
 				},
 				_ => {},
 			}
@@ -702,8 +786,7 @@ mod integration_tests {
 	}
 
 	#[test]
-	#[should_panic]
-	fn wrong_varuint1_case() {
+	fn varuint1_case() {
 		let _module = deserialize_file("./res/cases/v1/varuint1_1.wasm")
 			.expect("Maybe shouldn't be deserialized");
 	}
@@ -714,4 +797,58 @@ mod integration_tests {
 		let module = deserialize_file("./res/cases/v1/two-mems.wasm").expect("failed to deserialize");
 		assert_eq!(module.memory_space(), 2);
 	}
+
+    #[test]
+    fn add_custom_section() {
+        let mut module = deserialize_file("./res/cases/v1/start_mut.wasm").expect("failed to deserialize");
+        assert!(module.custom_sections().next().is_none());
+        module.set_custom_section("mycustomsection".to_string(), vec![1, 2, 3, 4]);
+        {
+	        let sections = module.custom_sections().collect::<Vec<_>>();
+	        assert_eq!(sections.len(), 1);
+	        assert_eq!(sections[0].name(), "mycustomsection");
+	        assert_eq!(sections[0].payload(), &[1, 2, 3, 4]);
+	    }
+
+        let old_section = module.clear_custom_section("mycustomsection");
+        assert_eq!(old_section.expect("Did not find custom section").payload(), &[1, 2, 3, 4]);
+
+        assert!(module.custom_sections().next().is_none());
+    }
+
+    #[test]
+    fn mut_start() {
+        let mut module = deserialize_file("./res/cases/v1/start_mut.wasm").expect("failed to deserialize");
+        assert_eq!(module.start_section().expect("Did not find any start section"), 1);
+        module.set_start_section(0);
+        assert_eq!(module.start_section().expect("Did not find any start section"), 0);
+        module.clear_start_section();
+        assert_eq!(None, module.start_section());
+    }
+
+    #[test]
+    fn add_start() {
+        let mut module = deserialize_file("./res/cases/v1/start_add.wasm").expect("failed to deserialize");
+        assert!(module.start_section().is_none());
+        module.set_start_section(0);
+        assert_eq!(module.start_section().expect("Did not find any start section"), 0);
+
+        let sections = module.sections().iter().map(|s| s.order()).collect::<Vec<_>>();
+        assert_eq!(sections, vec![1, 2, 3, 6, 7, 8, 9, 11, 12]);
+    }
+
+    #[test]
+    fn add_start_custom() {
+        let mut module = deserialize_file("./res/cases/v1/start_add_custom.wasm").expect("failed to deserialize");
+
+        let sections = module.sections().iter().map(|s| s.order()).collect::<Vec<_>>();
+        assert_eq!(sections, vec![1, 2, 3, 6, 7, 9, 11, 12, 0]);
+
+        assert!(module.start_section().is_none());
+        module.set_start_section(0);
+        assert_eq!(module.start_section().expect("Dorder not find any start section"), 0);
+
+        let sections = module.sections().iter().map(|s| s.order()).collect::<Vec<_>>();
+        assert_eq!(sections, vec![1, 2, 3, 6, 7, 8, 9, 11, 12, 0]);
+    }
 }
